@@ -120,5 +120,5 @@ app.get("/", (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Express server listening at http://rd-img.netlify.app:${port}`);
+  console.log(`Express server listening at http://localhost:${port}`);
 });

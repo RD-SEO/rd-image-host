@@ -1,64 +1,124 @@
-// Import
-const app = require("express")();
-const bodyParser = require("body-parser");
-const multer = require("multer");
-const fs = require("fs");
+import "dotenv/config";
+import express from "express";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import fetch from "node-fetch";
+import favicon from "serve-favicon";
 
-// Config
-const config = require("./config.js");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const app = express();
 
-function genName() {
-  let chars = config.chars;
-  let out = [];
-  for(let i = 0; i < config.fileLen; i ++, out.push(chars[Math.floor(Math.random() * chars.length)]));
-  return out.join("");
+// Use serve-favicon middleware to serve favicon.ico
+app.use(favicon(path.join(__dirname, "assets", "favicon.ico")));
+
+// if blacklist.json is stored securely outside of the public directory
+const blacklistFilePath = path.join(__dirname, "../config/blacklist.json");
+let blacklistedIps = new Set();
+
+const loadBlacklist = () => {
+  try {
+    const data = fs.readFileSync(blacklistFilePath, "utf-8");
+    const blacklist = JSON.parse(data);
+    blacklistedIps = new Set(blacklist);
+  } catch (error) {
+    console.error(`Error loading blacklist from file: ${error.message}`);
+  }
+};
+
+// Call loadBlacklist on application startup and refresh every so often
+loadBlacklist();
+setInterval(loadBlacklist, 60000); // Refresh interval in milliseconds
+
+// Middleware to check against the blacklist, prevent abuse
+const blacklistMiddleware = (req, res, next) => {
+  const ip = req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+  if (blacklistedIps.has(ip)) {
+    return res.status(403).send("Access denied.");
+  }
+  next();
+};
+
+app.use(blacklistMiddleware);
+
+app.use(
+  express.static("public", {
+    setHeaders: function (res, path) {
+      if (path.endsWith(".css")) {
+        res.set("Content-Type", "text/css");
+      }
+    },
+  }),
+);
+
+// Configure multer Storage
+const storage = multer.diskStorage({
+  destination: "./uploads/",
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + path.extname(file.originalname));
+  },
+});
+
+const upload = multer({ storage: storage });
+
+const uploadDir = "./uploads";
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
 }
 
-function createPaste(url) {
-  let matches = url.match(/^data:.+\/(.+);base64,(.*)$/);
-  let ext = matches[1];
-  let data = matches[2];
-  let buffer = Buffer.from(data, 'base64');
-  let name = genName() + '.' + ext;
-  fs.writeFileSync("static/" + name, buffer);
-  return name;
-}
+app.use("/uploads", express.static("uploads"));
 
-// Use Body Parser
-app.use(bodyParser.urlencoded({ extended: false }));
+// POST endpoint to handle single file uploads
+app.post("/upload", upload.single("file"), (req, res) => {
+  const tosAgreed = req.body.tosAgreed === "true";
+  if (!tosAgreed) {
+    return res.status(400).send("You must agree to the terms of service before uploading.");
+  }
+  const file = req.file;
+  if (!file) {
+    return res.status(400).send("No file uploaded.");
+  }
+  const ip = req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+  const userAgent = req.headers["user-agent"];
+  const logMessage = `Uploaded file: ${file.originalname}, Size: ${file.size}, IP: ${ip}, User Agent: ${userAgent}`;
 
-// Use Multer
-let upload = multer({ dest: 'static/' });
+  // Log file, IP, and User Agent to the console and send to the webhook
+  console.log(logMessage);
+  sendLogToDiscord(logMessage);
+  res.status(200).json({
+    message: "Upload successful!",
+    filename: file.filename,
+    path: file.path,
+    url: `${req.protocol}://${req.get("host")}/uploads/${file.filename}`,
+  });
+});
 
-// Statics
-app.use(require("express").static(__dirname + "/static"));
-app.use(require("express").static(__dirname + "/public"));
-
-// Route
-app
-  .get("/", (_r, res) => res.sendFile(__dirname + "/index.html"))
-  .get("/upload", (_r, res) => res.sendFile(__dirname + "/upload.html"))
-  .get("/paste", (_r, res) => res.sendFile(__dirname + "/paste.html"))
-  .post("/upload_paste", (req, res) => {
-    if (!/data:/.test(req.body.url)) {
-      res.end("This image is not currently supported");
+// Send log information to Discord webhook
+const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
+const port = process.env.PORT || 3000;
+const sendLogToDiscord = async (message) => {
+  const payload = JSON.stringify({ content: message });
+  try {
+    const response = await fetch(discordWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+    });
+    if (!response.ok) {
+      console.error(`Failed to send log to Discord: ${response.statusText}`);
     }
-    let file = createPaste(req.body.url);
-    res.send(fs.readFileSync("success.html", "utf8").replace(/\$name/g, file));
-  })
-  .post("/upload", upload.single('data'), (req, res) => {
-    if (!/image/.test(req.file.mimetype)) {
-      res.end("no")
-      return;
-    }
-    let ext = req.file.mimetype.split("/")[1];
-    let name = genName() + "." + ext;
-    fs.renameSync(req.file.path, "static/" + name);
-    res.send(fs.readFileSync("success.html", "utf8").replace(/\$name/g, name));
-  })
-;
+  } catch (error) {
+    console.error(`Error sending log to Discord: ${error}`);
+  }
+};
 
-// Listen
-app.listen(8080);
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
-console.log("localhost:8080")
+app.listen(port, () => {
+  console.log(`Express server listening at http://rd-img.netlify.app:${port}`);
+});
